@@ -1,0 +1,30 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Binary output
+itch_engine
+
+# Data files
+*.bin
+*.itch
+*.NASDAQ_ITCH50
+*.gz
+
+# Latency output
+*.csv
+latencies*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+x
+X
+
