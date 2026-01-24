@@ -4,14 +4,15 @@ A production-style, high-performance C++20 market data engine for processing NAS
 
 ## Features
 
-- **Three benchmark modes**: Parse-only, parse+book (single-thread), pipeline+book (dual-thread SPSC)
+- **Four benchmark modes**: Parse-only, parse+book (filtered), pipeline+book (dual-thread), full_book (all symbols)
+- **L3 CSV export**: Normalized event stream (ADD/CANCEL/EXEC/TRADE) for microstructure simulation
 - **Zero-copy parsing**: Memory-maps ITCH files for maximum throughput
 - **Full message support**: Parses S, A, F, E, C, X, D, U, P message types
 - **Order book reconstruction**: Maintains accurate limit order books per symbol
 - **O(1) order lookup**: Custom Robin Hood hash table for order ID → order mapping
 - **Performance metrics**: Per-message latency tracking with p50/p99/p99.9/max percentiles
 - **Symbol filtering**: Track specific symbols for cache-friendly benchmarking
-- **High throughput**: Processes 423M+ messages in ~40-50 seconds
+- **High throughput**: 4.5M msgs/sec full_book, 10.1M msgs/sec parse-only
 
 ## Architecture
 
@@ -29,17 +30,16 @@ src/
 
 ### Prerequisites
 - C++20 compatible compiler (GCC 10+, Clang 12+)
-- CMake 3.20+
+- Make
 
 ### Build steps
 
 ```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
+make              # Build optimized release binary + replay tool
+make clean        # Clean build artifacts
 ```
 
-The compiled binary will be `build/itch_engine`.
+The compiled binaries will be `itch_engine` and `replay_csv`.
 
 ## Benchmark Modes
 
@@ -86,15 +86,17 @@ Tested on 423M messages from 01/30/2020 NASDAQ ITCH file (~12GB decompressed):
 | Mode | Throughput | Wall Time | p50 | p99 | p99.9 | Symbols | Description |
 |------|-----------|-----------|-----|-----|-------|---------|-------------|
 | **parse** | 10.1M/s | 41.9s | 0 ns | 42 ns | 958 ns | N/A | Parse + decode only |
-| **parse_book** | 9.4M/s | 45.2s | 0 ns | 83 ns | 2.8 µs | 1 | Parse + book (filtered) |
-| **pipeline_book** | 9.8M/s | 43.4s | 14 µs | 228 µs | 8.8 ms | 1 | Pipeline (2 threads, SPSC) |
-| **full_book** | **4.5M/s** | **93.8s** | **84 ns** | **750 ns** | **3.1 µs** | **8900** | **Realistic stress test** |
+| **parse_book** | 8.5M/s | 49.9s | 0 ns | 83 ns | 2.8 µs | 1-10 | Parse + book (filtered) |
+| **pipeline_book** | 9.8M/s | 43.4s | 14 µs | 228 µs | 8.8 ms | 1-10 | Pipeline (2 threads, SPSC) |
+| **full_book** | **4.5M/s** | **93.8s** | **84 ns** | **750 ns** | **3.1 µs** | **8900** | **Full market stress test** |
 
-### Full Book Mode Results (Validation Metrics)
+### Full Book Mode - Production Validation
+
+Processing 423,285,709 messages from a complete NASDAQ trading day:
 
 ```
 Total messages:        423,285,709
-Book operations:
+Book operations:       417,219,234 (99% book hit rate)
   - adds:              186,610,705 (44%)
   - execs:               8,555,084 (2%)
   - deletes:           180,285,101 (43%)
@@ -102,20 +104,108 @@ Book operations:
   - cancels:             4,990,972 (1%)
 Unknown order events:  0 ✅
 Skipped symbols:       0 ✅
-Book hit fraction:     0.99 (99% of messages touched the book)
 Symbols tracked:       8,900 ✅
 Live orders at end:    0 ✅
 ```
 
-**Key Observations**:
+**Key Achievements**:
+- ✅ **4.5M msgs/sec** sustained throughput with full book maintenance
 - ✅ **99% book hit rate** - Nearly all messages involve book operations
-- ✅ **Zero unknown events** - All order IDs successfully tracked
-- ✅ **Zero skipped symbols** - Full market coverage
+- ✅ **Zero unknown events** - Perfect order ID tracking across 186M adds
 - ✅ **8,900 symbols** - Complete NASDAQ order book reconstruction
-- ⚡ **4.5M msgs/sec** - Realistic throughput with full book maintenance (55% slower than parse-only)
-- 📊 **Clean book state** - 0 live orders at end indicates proper order lifecycle handling
+- ✅ **Clean book state** - Zero live orders at market close
 
-## Usage Examples
+## L3 CSV Export for Microstructure Simulation
+
+The engine can export a normalized L3 event stream suitable for Python-based microstructure simulators.
+
+### CSV Schema
+
+```
+timestamp_ns,event_type,order_id,price_ticks,size,side
+```
+
+**Columns**:
+- `timestamp_ns`: Exchange timestamp (int64, nanoseconds since midnight)
+- `event_type`: ADD | CANCEL | EXEC | TRADE
+- `order_id`: uint64 (0 for TRADE events)
+- `price_ticks`: int64 (integer price, no floats)
+- `size`: int32 (shares)
+- `side`: B (buy) or S (sell)
+
+### Event Semantics
+
+| ITCH Message | CSV Event | Behavior |
+|--------------|-----------|----------|
+| A, F (Add Order) | ADD | New order enters book |
+| X (Cancel), D (Delete) | CANCEL | Partial/full order removal |
+| E, C (Executed) | EXEC | Order execution (reduces size) |
+| U (Replace) | CANCEL + ADD | Atomic replace (2 CSV rows) |
+| P (Trade) | TRADE | Non-book print (order_id=0, informational) |
+
+### Price Ticks (No Floats!)
+
+ITCH prices are stored as `price × 10000` (e.g., $123.45 = 1234500).
+
+Use `--tick-size-1e4 <divisor>` to convert to integer ticks:
+```bash
+# Default: tick_size = 0.0001, divisor = 1
+price_ticks = price_1e4 / 1
+
+# For 1-cent ticks: divisor = 100
+price_ticks = price_1e4 / 100
+```
+
+### Usage
+
+#### Generate CSV for full trading day
+```bash
+# Prerequisite: decompress ITCH file
+gunzip -k 01302020.NASDAQ_ITCH50.gz
+
+# Generate CSV (logs go to stderr, CSV to stdout)
+./itch_engine --file 01302020.NASDAQ_ITCH50 --mode full_book --csv --csv-header > simulation_input.csv 2> logs.txt
+
+# Check results
+wc -l simulation_input.csv
+# Expected: ~417M rows (99% book hit rate)
+```
+
+#### Validate CSV (Replay & Verify)
+```bash
+# Replay CSV and rebuild order book
+./replay_csv simulation_input.csv
+
+# Output shows:
+# - Total events processed
+# - Book operations breakdown
+# - Final best bid/ask
+# - Live orders remaining
+```
+
+### CSV Generation Performance
+
+Processing a full trading day (423M messages):
+```
+Wall time:         253 seconds
+Throughput:        1.67M msgs/sec (with CSV writing)
+CSV file size:     18GB
+CSV rows exported: 454M events
+```
+
+**Why more CSV rows than ITCH messages?**
+- Each Replace (U) message generates 2 CSV rows: CANCEL (old order) + ADD (new order)
+- 36.8M replaces × 2 = 73.5M additional rows
+- 423M ITCH messages → 454M CSV events ✅
+
+**CSV Sample**:
+```csv
+timestamp_ns,event_type,order_id,price_ticks,size,side
+14400000768178,ADD,8,198400,1500,B
+14400000883067,ADD,40,198100,2200,B
+14400000979447,ADD,80,198700,1500,S
+14400001057567,ADD,112,199000,2200,S
+```
 
 ### Step 0: Decompress ITCH file
 
@@ -233,15 +323,14 @@ Options:
   --mode <mode>           Benchmark mode: parse|parse_book|pipeline_book|full_book (default: parse)
   --symbol <SYM>          Track single symbol (e.g., AAPL) [parse_book/pipeline_book only]
   --symbols <SYM,SYM,...> Track multiple symbols (e.g., AAPL,MSFT,AMZN) [parse_book/pipeline_book only]
+  --csv                   Export L3 event stream to stdout (logs go to stderr)
+  --csv-header            Include CSV header row
+  --tick-size-1e4 <int>   Tick size divisor for price_ticks (default: 1 = $0.0001)
   --print-first <N>       Print first N messages in human-readable form
   --latency-out <file>    Dump latencies to file (one per line, ns)
   --show-book-updates     Show book state periodically
   --debug-symbols         Print first 20 symbols encountered (with keys + filter status)
   --help                  Show this help message
-
-Deprecated (for backward compatibility):
-  --enable-book           Maps to --mode=parse_book
-  --use-spsc              Maps to --mode=pipeline_book
 ```
 
 ## Development Roadmap
@@ -255,6 +344,8 @@ Deprecated (for backward compatibility):
 - [x] **Symbol correctness**: Fixed SymbolKey extraction offset, added --debug-symbols
 - [x] **Book hit metrics**: Counters for adds/execs/deletes/cancels/replaces, book-hit fraction
 - [x] **Zero-allocation hot path**: Order stores SymbolKey instead of std::string
+- [x] **L3 CSV export**: Normalized event stream for microstructure simulation (ADD/CANCEL/EXEC/TRADE)
+- [x] **Replay validator**: Tool to rebuild book from CSV and verify correctness
 
 ## File Format
 

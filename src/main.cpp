@@ -14,6 +14,9 @@ void print_usage(const char* prog) {
     std::cout << "  --latency-out <file>    Dump latencies to file (one per line, ns)\n";
     std::cout << "  --show-book-updates     Show book state periodically\n";
     std::cout << "  --debug-symbols         Print first 20 symbols encountered (with keys + filter status)\n";
+    std::cout << "  --csv                   Export L3 event stream to stdout (logs go to stderr)\n";
+    std::cout << "  --tick-size-1e4 <int>   Tick size divisor for price_ticks (default: 1 = $0.0001)\n";
+    std::cout << "  --csv-header            Include CSV header row\n";
     std::cout << "  --help                  Show this help message\n";
     std::cout << "\nDeprecated (for backward compatibility):\n";
     std::cout << "  --enable-book           Maps to --mode=parse_book\n";
@@ -76,6 +79,16 @@ int main(int argc, char** argv) {
             config.show_book_updates = true;
         } else if (arg == "--debug-symbols") {
             config.debug_symbols = true;
+        } else if (arg == "--csv") {
+            config.csv_export = true;
+        } else if (arg == "--tick-size-1e4" && i + 1 < argc) {
+            config.tick_size_1e4 = std::stoi(argv[++i]);
+            if (config.tick_size_1e4 <= 0) {
+                std::cerr << "Error: --tick-size-1e4 must be positive\n";
+                return 1;
+            }
+        } else if (arg == "--csv-header") {
+            config.csv_header = true;
         } else if (arg == "--enable-book") {
             // Deprecated: map to parse_book mode
             config.mode = BenchmarkMode::PARSE_BOOK;

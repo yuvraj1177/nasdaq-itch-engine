@@ -6,7 +6,11 @@
 #include <thread>
 
 Engine::Engine(const Config& config) 
-    : config_(config), msg_count_(0) {
+    : config_(config), msg_count_(0), csv_exporter_(nullptr) {
+    // Initialize CSV exporter if requested
+    if (config_.csv_export) {
+        csv_exporter_ = new L3CsvExporter(stdout, config_.tick_size_1e4, config_.csv_header);
+    }
 }
 
 void Engine::debug_print_symbol(const std::string& stock, SymbolKey key, bool matches_filter) {
@@ -20,23 +24,29 @@ void Engine::debug_print_symbol(const std::string& stock, SymbolKey key, bool ma
 }
 
 void Engine::run() {
-    std::cout << "Starting ITCH 5.0 Engine...\n";
-    std::cout << "Input file: " << config_.input_file << "\n";
+    // Use stderr for all logs when CSV export is enabled
+    FILE* log_out = config_.csv_export ? stderr : stdout;
+    
+    fprintf(log_out, "Starting ITCH 5.0 Engine...\n");
+    fprintf(log_out, "Input file: %s\n", config_.input_file.c_str());
     
     // Print mode
     const char* mode_str = "parse";
     if (config_.mode == BenchmarkMode::PARSE_BOOK) mode_str = "parse_book";
     else if (config_.mode == BenchmarkMode::PIPELINE_BOOK) mode_str = "pipeline_book";
     else if (config_.mode == BenchmarkMode::FULL_BOOK) mode_str = "full_book";
-    std::cout << "Mode: " << mode_str << "\n";
+    fprintf(log_out, "Mode: %s\n", mode_str);
     
     if (!config_.symbols.empty()) {
-        std::cout << "Tracking symbols: " << config_.symbols.size() << "\n";
+        fprintf(log_out, "Tracking symbols: %zu\n", config_.symbols.size());
     }
     if (config_.print_first > 0) {
-        std::cout << "Print first: " << config_.print_first << " messages\n";
+        fprintf(log_out, "Print first: %llu messages\n", config_.print_first);
     }
-    std::cout << "\n";
+    if (config_.csv_export) {
+        fprintf(log_out, "CSV export: enabled (tick_size_1e4=%d)\n", config_.tick_size_1e4);
+    }
+    fprintf(log_out, "\n");
 
     // Pre-create books for tracked symbols
     if (config_.mode != BenchmarkMode::PARSE && !config_.symbols.empty()) {
@@ -70,35 +80,51 @@ void Engine::run() {
     }
 
     latency_tracker_.stop_timing();
+    
+    // Flush CSV before stats
+    if (csv_exporter_) {
+        csv_exporter_->flush();
+    }
+    
+    // Print stats to stderr if CSV export enabled
+    if (config_.csv_export) {
+        fprintf(log_out, "\n========== PERFORMANCE STATISTICS ==========\n");
+    }
+    
     latency_tracker_.compute_and_print_stats();
     
     if (!config_.latency_output.empty()) {
         latency_tracker_.dump_to_file(config_.latency_output);
     }
 
-    std::cout << "\nProcessing complete.\n";
-    std::cout << "Total messages processed: " << msg_count_ << "\n";
-    std::cout << "Book operations: adds=" << adds_ << " execs=" << execs_ 
-              << " deletes=" << deletes_ << " replaces=" << replaces_ 
-              << " cancels=" << cancels_ << "\n";
-    std::cout << "Unknown order events: " << unknown_order_events_ << "\n";
-    std::cout << "Skipped symbols: " << skipped_symbols_ << "\n";
+    fprintf(log_out, "\nProcessing complete.\n");
+    fprintf(log_out, "Total messages processed: %llu\n", msg_count_);
+    fprintf(log_out, "Book operations: adds=%llu execs=%llu deletes=%llu replaces=%llu cancels=%llu\n",
+            adds_, execs_, deletes_, replaces_, cancels_);
+    fprintf(log_out, "Unknown order events: %llu\n", unknown_order_events_);
+    fprintf(log_out, "Skipped symbols: %llu\n", skipped_symbols_);
     
     // Compute and print book-hit fraction
     uint64_t total_book_ops = adds_ + execs_ + deletes_ + replaces_ + cancels_;
     if (msg_count_ > 0) {
         double book_hit_fraction = static_cast<double>(total_book_ops) / static_cast<double>(msg_count_);
-        std::cout << "Book hit fraction: " << book_hit_fraction << " (" 
-                  << total_book_ops << " / " << msg_count_ << ")\n";
+        fprintf(log_out, "Book hit fraction: %.2f (%llu / %llu)\n", 
+                book_hit_fraction, total_book_ops, msg_count_);
     }
     
     if (config_.mode != BenchmarkMode::PARSE) {
         if (config_.mode == BenchmarkMode::FULL_BOOK) {
-            std::cout << "\nOrder books maintained: " << symbol_book_registry_.size() << " symbols\n";
+            fprintf(log_out, "\nOrder books maintained: %zu symbols\n", symbol_book_registry_.size());
         } else {
-            std::cout << "\nOrder books maintained: " << book_registry_.size() << " symbols\n";
+            fprintf(log_out, "\nOrder books maintained: %zu symbols\n", book_registry_.size());
         }
-        std::cout << "Live orders in table: " << order_table_.size() << "\n";
+        fprintf(log_out, "Live orders in table: %zu\n", order_table_.size());
+    }
+    
+    if (csv_exporter_) {
+        fprintf(log_out, "CSV rows exported: %llu\n", csv_exporter_->rows_written());
+        delete csv_exporter_;
+        csv_exporter_ = nullptr;
     }
 }
 
@@ -688,6 +714,12 @@ void Engine::run_full_book() {
                 if (book) {
                     book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
                     adds_++;
+                    
+                    // CSV export
+                    if (csv_exporter_) {
+                        csv_exporter_->on_add(msg.timestamp, msg.order_ref_number, 
+                                             msg.price, msg.shares, msg.buy_sell);
+                    }
                 }
                 break;
             }
@@ -712,6 +744,12 @@ void Engine::run_full_book() {
                 if (book) {
                     book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
                     adds_++;
+                    
+                    // CSV export
+                    if (csv_exporter_) {
+                        csv_exporter_->on_add(msg.timestamp, msg.order_ref_number, 
+                                             msg.price, msg.shares, msg.buy_sell);
+                    }
                 }
                 break;
             }
@@ -725,6 +763,13 @@ void Engine::run_full_book() {
                     auto* book = symbol_book_registry_.get_or_create(order->symbol);
                     if (book) {
                         book->remove_order(order->side, order->price, msg.executed_shares);
+                        
+                        // CSV export (before qty update)
+                        if (csv_exporter_) {
+                            csv_exporter_->on_exec(msg.timestamp, msg.order_ref_number, 
+                                                  order->price, msg.executed_shares, order->side);
+                        }
+                        
                         order->qty -= msg.executed_shares;
                         if (order->qty == 0) {
                             order_table_.erase(msg.order_ref_number);
@@ -746,6 +791,13 @@ void Engine::run_full_book() {
                     auto* book = symbol_book_registry_.get_or_create(order->symbol);
                     if (book) {
                         book->remove_order(order->side, order->price, msg.executed_shares);
+                        
+                        // CSV export (before qty update)
+                        if (csv_exporter_) {
+                            csv_exporter_->on_exec(msg.timestamp, msg.order_ref_number, 
+                                                  order->price, msg.executed_shares, order->side);
+                        }
+                        
                         order->qty -= msg.executed_shares;
                         if (order->qty == 0) {
                             order_table_.erase(msg.order_ref_number);
@@ -767,6 +819,13 @@ void Engine::run_full_book() {
                     auto* book = symbol_book_registry_.get_or_create(order->symbol);
                     if (book) {
                         book->remove_order(order->side, order->price, msg.cancelled_shares);
+                        
+                        // CSV export (before qty update)
+                        if (csv_exporter_) {
+                            csv_exporter_->on_cancel(msg.timestamp, msg.order_ref_number, 
+                                                    order->price, msg.cancelled_shares, order->side);
+                        }
+                        
                         order->qty -= msg.cancelled_shares;
                         if (order->qty == 0) {
                             order_table_.erase(msg.order_ref_number);
@@ -788,6 +847,13 @@ void Engine::run_full_book() {
                     auto* book = symbol_book_registry_.get_or_create(order->symbol);
                     if (book) {
                         book->remove_order(order->side, order->price, order->qty);
+                        
+                        // CSV export (before deletion)
+                        if (csv_exporter_) {
+                            csv_exporter_->on_cancel(msg.timestamp, msg.order_ref_number, 
+                                                    order->price, order->qty, order->side);
+                        }
+                        
                         order_table_.erase(msg.order_ref_number);
                         deletes_++;
                     }
@@ -806,6 +872,14 @@ void Engine::run_full_book() {
                     auto* book = symbol_book_registry_.get_or_create(old_order->symbol);
                     if (book) {
                         book->remove_order(old_order->side, old_order->price, old_order->qty);
+                        
+                        // CSV export: CANCEL old + ADD new
+                        if (csv_exporter_) {
+                            csv_exporter_->on_cancel(msg.timestamp, msg.original_order_ref_number, 
+                                                    old_order->price, old_order->qty, old_order->side);
+                            csv_exporter_->on_add(msg.timestamp, msg.new_order_ref_number, 
+                                                 msg.price, msg.shares, old_order->side);
+                        }
                         
                         Order new_order = *old_order;
                         new_order.order_id = msg.new_order_ref_number;

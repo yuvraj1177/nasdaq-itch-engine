@@ -18,6 +18,7 @@ using OrderBook = OptimizedOrderBook;
 #endif
 
 #include "latency_tracker.h"
+#include "l3_csv_exporter.h"
 
 // Benchmark modes
 enum class BenchmarkMode {
@@ -99,6 +100,11 @@ public:
         bool show_book_updates = false;
         bool debug_symbols = false;
         
+        // CSV export options
+        bool csv_export = false;
+        int32_t tick_size_1e4 = 1; // Default: 0.0001 tick size
+        bool csv_header = false;
+        
         // Deprecated (mapped to mode for backward compat)
         bool enable_book = false;
         bool enable_timing = false;
@@ -131,6 +137,9 @@ private:
     SymbolBookRegistry symbol_book_registry_; // For full_book mode
     LatencyTracker latency_tracker_;
     uint64_t msg_count_;
+    
+    // CSV exporter (optional)
+    L3CsvExporter* csv_exporter_;
     
     // Counters for observability
     uint64_t adds_ = 0;
