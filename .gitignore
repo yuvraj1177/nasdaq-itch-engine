@@ -1,3 +1,20 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.out
+
+# Data files
+*.NASDAQ_ITCH50
+*.gz
+
+# Outputs
+latencies*.csv
+*.png
+
+# IDE
+.vscode/
+.idea/
 # Build directories
 build/
 cmake-build-*/
