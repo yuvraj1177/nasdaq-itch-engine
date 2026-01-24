@@ -70,6 +70,7 @@ struct MessageEnvelope {
     uint16_t padding;
     const uint8_t* data; // Pointer into mmap'd region (zero-copy)
     uint64_t seq;
+    uint64_t t0_ns; // Timestamp when message entered pipeline (nanoseconds)
 };
 
 using ITCHQueue = SPSCQueue<MessageEnvelope, 65536>; // 64K message queue

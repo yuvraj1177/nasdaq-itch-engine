@@ -9,46 +9,101 @@ Engine::Engine(const Config& config)
     : config_(config), msg_count_(0) {
 }
 
+void Engine::debug_print_symbol(const std::string& stock, SymbolKey key, bool matches_filter) {
+    if (!config_.debug_symbols || debug_symbol_count_ >= 20) return;
+    
+    std::cout << "DEBUG Symbol #" << debug_symbol_count_ + 1 << ": "
+              << "\"" << stock << "\" "
+              << "(key=0x" << std::hex << key << std::dec << ") "
+              << "filter_match=" << (matches_filter ? "YES" : "NO") << "\n";
+    debug_symbol_count_++;
+}
+
 void Engine::run() {
     std::cout << "Starting ITCH 5.0 Engine...\n";
     std::cout << "Input file: " << config_.input_file << "\n";
-    std::cout << "Print first: " << config_.print_first << " messages\n";
-    std::cout << "Order book enabled: " << (config_.enable_book ? "yes" : "no") << "\n";
-    std::cout << "Timing enabled: " << (config_.enable_timing ? "yes" : "no") << "\n";
-    std::cout << "SPSC mode: " << (config_.use_spsc_mode ? "yes (multi-threaded)" : "no (single-threaded)") << "\n";
-    if (!config_.symbol_filter.empty()) {
-        std::cout << "Symbol filter: " << config_.symbol_filter << "\n";
+    
+    // Print mode
+    const char* mode_str = "parse";
+    if (config_.mode == BenchmarkMode::PARSE_BOOK) mode_str = "parse_book";
+    else if (config_.mode == BenchmarkMode::PIPELINE_BOOK) mode_str = "pipeline_book";
+    else if (config_.mode == BenchmarkMode::FULL_BOOK) mode_str = "full_book";
+    std::cout << "Mode: " << mode_str << "\n";
+    
+    if (!config_.symbols.empty()) {
+        std::cout << "Tracking symbols: " << config_.symbols.size() << "\n";
+    }
+    if (config_.print_first > 0) {
+        std::cout << "Print first: " << config_.print_first << " messages\n";
     }
     std::cout << "\n";
 
-    if (config_.enable_timing) {
-        latency_tracker_.start_timing();
-    }
-
-    if (config_.use_spsc_mode) {
-        parse_and_process_spsc();
-    } else {
-        parse_and_process();
-    }
-
-    if (config_.enable_timing) {
-        latency_tracker_.stop_timing();
-        latency_tracker_.compute_and_print_stats();
-        
-        if (!config_.latency_output.empty()) {
-            latency_tracker_.dump_to_file(config_.latency_output);
+    // Pre-create books for tracked symbols
+    if (config_.mode != BenchmarkMode::PARSE && !config_.symbols.empty()) {
+        for (SymbolKey key : config_.symbols.keys()) {
+            // Convert key back to string for book registry
+            std::string sym;
+            for (int i = 0; i < 8; ++i) {
+                char c = static_cast<char>((key >> (i * 8)) & 0xFF);
+                if (c != ' ') sym += c;
+            }
+            book_registry_.get_or_create(sym);
         }
+    }
+
+    latency_tracker_.start_timing();
+
+    // Dispatch to correct benchmark mode
+    switch (config_.mode) {
+        case BenchmarkMode::PARSE:
+            run_parse();
+            break;
+        case BenchmarkMode::PARSE_BOOK:
+            run_parse_book();
+            break;
+        case BenchmarkMode::PIPELINE_BOOK:
+            run_pipeline_book();
+            break;
+        case BenchmarkMode::FULL_BOOK:
+            run_full_book();
+            break;
+    }
+
+    latency_tracker_.stop_timing();
+    latency_tracker_.compute_and_print_stats();
+    
+    if (!config_.latency_output.empty()) {
+        latency_tracker_.dump_to_file(config_.latency_output);
     }
 
     std::cout << "\nProcessing complete.\n";
     std::cout << "Total messages processed: " << msg_count_ << "\n";
+    std::cout << "Book operations: adds=" << adds_ << " execs=" << execs_ 
+              << " deletes=" << deletes_ << " replaces=" << replaces_ 
+              << " cancels=" << cancels_ << "\n";
+    std::cout << "Unknown order events: " << unknown_order_events_ << "\n";
+    std::cout << "Skipped symbols: " << skipped_symbols_ << "\n";
     
-    if (config_.enable_book) {
-        std::cout << "Order books maintained: " << book_registry_.size() << " symbols\n";
+    // Compute and print book-hit fraction
+    uint64_t total_book_ops = adds_ + execs_ + deletes_ + replaces_ + cancels_;
+    if (msg_count_ > 0) {
+        double book_hit_fraction = static_cast<double>(total_book_ops) / static_cast<double>(msg_count_);
+        std::cout << "Book hit fraction: " << book_hit_fraction << " (" 
+                  << total_book_ops << " / " << msg_count_ << ")\n";
+    }
+    
+    if (config_.mode != BenchmarkMode::PARSE) {
+        if (config_.mode == BenchmarkMode::FULL_BOOK) {
+            std::cout << "\nOrder books maintained: " << symbol_book_registry_.size() << " symbols\n";
+        } else {
+            std::cout << "\nOrder books maintained: " << book_registry_.size() << " symbols\n";
+        }
+        std::cout << "Live orders in table: " << order_table_.size() << "\n";
     }
 }
 
-void Engine::parse_and_process() {
+// Mode 1: Parse only (no book updates)
+void Engine::run_parse() {
     MappedFile mfile(config_.input_file);
     
     const uint8_t* ptr = mfile.data();
@@ -57,32 +112,746 @@ void Engine::parse_and_process() {
     uint64_t seq = 0;
     
     while (ptr + 2 <= end) {
-        // Read 2-byte big-endian length
         uint16_t msg_len = be16_to_host(ptr);
         ptr += 2;
         
-        // Validate length
-        if (ptr + msg_len > end) {
-            std::cerr << "Incomplete message at end of file (expected " 
-                      << msg_len << " bytes, have " << (end - ptr) << ")\n";
-            break;
-        }
+        if (ptr + msg_len > end || msg_len < 1) break;
         
-        if (msg_len < 1) {
-            std::cerr << "Invalid message length: " << msg_len << "\n";
-            break;
-        }
-        
-        // Read message type
         char msg_type = static_cast<char>(*ptr);
         
-        // Process message
-        process_message(msg_type, ptr, msg_len, seq);
+        auto t0 = std::chrono::steady_clock::now();
+        
+        // Parse message but don't apply to book
+        const uint8_t* payload = ptr + 1;
+        bool should_print = seq < config_.print_first;
+        
+        switch (msg_type) {
+            case 'S': {
+                itch::SystemEvent msg;
+                msg.parse(payload);
+                if (should_print) itch::print_system_event(msg, seq);
+                break;
+            }
+            case 'A': {
+                itch::AddOrder msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order(msg, seq);
+                break;
+            }
+            case 'F': {
+                itch::AddOrderMPID msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order_mpid(msg, seq);
+                break;
+            }
+            case 'E': {
+                itch::OrderExecuted msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed(msg, seq);
+                break;
+            }
+            case 'C': {
+                itch::OrderExecutedWithPrice msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed_with_price(msg, seq);
+                break;
+            }
+            case 'X': {
+                itch::OrderCancel msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_cancel(msg, seq);
+                break;
+            }
+            case 'D': {
+                itch::OrderDelete msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_delete(msg, seq);
+                break;
+            }
+            case 'U': {
+                itch::OrderReplace msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_replace(msg, seq);
+                break;
+            }
+            case 'P': {
+                itch::Trade msg;
+                msg.parse(payload);
+                if (should_print) itch::print_trade(msg, seq);
+                break;
+            }
+            default:
+                break;
+        }
+        
+        auto t1 = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        latency_tracker_.record(dt);
         
         ptr += msg_len;
         seq++;
         msg_count_++;
     }
+}
+
+// Mode 2: Parse + book (single-threaded)
+void Engine::run_parse_book() {
+    MappedFile mfile(config_.input_file);
+    
+    const uint8_t* ptr = mfile.data();
+    const uint8_t* end = ptr + mfile.size();
+    
+    uint64_t seq = 0;
+    
+    while (ptr + 2 <= end) {
+        uint16_t msg_len = be16_to_host(ptr);
+        ptr += 2;
+        
+        if (ptr + msg_len > end || msg_len < 1) break;
+        
+        char msg_type = static_cast<char>(*ptr);
+        
+        auto t0 = std::chrono::steady_clock::now();
+        
+        // Parse AND apply to book
+        const uint8_t* payload = ptr + 1;
+        bool should_print = seq < config_.print_first;
+        
+        switch (msg_type) {
+            case 'A': {
+                itch::AddOrder msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order(msg, seq);
+                
+                SymbolKey sym_key = read_symbol_key(payload + 23); // stock offset (was 19, FIXED)
+                bool matches = config_.symbols.empty() || config_.symbols.contains(sym_key);
+                debug_print_symbol(msg.stock, sym_key, matches);
+                
+                if (matches) {
+                    Order order;
+                    order.order_id = msg.order_ref_number;
+                    order.symbol = sym_key;
+                    order.price = msg.price;
+                    order.qty = msg.shares;
+                    order.stock_locate = msg.stock_locate;
+                    order.side = msg.buy_sell;
+                    
+                    order_table_.insert(msg.order_ref_number, order);
+                    auto* book = book_registry_.get_or_create(msg.stock);
+                    book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                    adds_++;
+                } else {
+                    skipped_symbols_++;
+                }
+                break;
+            }
+            case 'F': {
+                itch::AddOrderMPID msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order_mpid(msg, seq);
+                
+                SymbolKey sym_key = read_symbol_key(payload + 23); // stock offset (was 19, FIXED)
+                bool matches = config_.symbols.empty() || config_.symbols.contains(sym_key);
+                debug_print_symbol(msg.stock, sym_key, matches);
+                
+                if (matches) {
+                    Order order;
+                    order.order_id = msg.order_ref_number;
+                    order.symbol = sym_key;
+                    order.price = msg.price;
+                    order.qty = msg.shares;
+                    order.stock_locate = msg.stock_locate;
+                    order.side = msg.buy_sell;
+                    
+                    order_table_.insert(msg.order_ref_number, order);
+                    auto* book = book_registry_.get_or_create(msg.stock);
+                    book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                    adds_++;
+                } else {
+                    skipped_symbols_++;
+                }
+                break;
+            }
+            case 'E': {
+                itch::OrderExecuted msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    auto* book = book_registry_.get_or_create(stock_str);
+                    book->remove_order(order->side, order->price, msg.executed_shares);
+                    order->qty -= msg.executed_shares;
+                    if (order->qty == 0) {
+                        order_table_.erase(msg.order_ref_number);
+                    }
+                    execs_++;
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'C': {
+                itch::OrderExecutedWithPrice msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed_with_price(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    auto* book = book_registry_.get_or_create(stock_str);
+                    book->remove_order(order->side, order->price, msg.executed_shares);
+                    order->qty -= msg.executed_shares;
+                    if (order->qty == 0) {
+                        order_table_.erase(msg.order_ref_number);
+                    }
+                    execs_++;
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'X': {
+                itch::OrderCancel msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_cancel(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    auto* book = book_registry_.get_or_create(stock_str);
+                    book->remove_order(order->side, order->price, msg.cancelled_shares);
+                    order->qty -= msg.cancelled_shares;
+                    if (order->qty == 0) {
+                        order_table_.erase(msg.order_ref_number);
+                    }
+                    cancels_++;
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'D': {
+                itch::OrderDelete msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_delete(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    auto* book = book_registry_.get_or_create(stock_str);
+                    book->remove_order(order->side, order->price, order->qty);
+                    order_table_.erase(msg.order_ref_number);
+                    deletes_++;
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'U': {
+                itch::OrderReplace msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_replace(msg, seq);
+                
+                Order* old_order = order_table_.find(msg.original_order_ref_number);
+                if (old_order) {
+                    std::string stock_str = symbol_key_to_string(old_order->symbol);
+                    auto* book = book_registry_.get_or_create(stock_str);
+                    book->remove_order(old_order->side, old_order->price, old_order->qty);
+                    
+                    Order new_order = *old_order;
+                    new_order.order_id = msg.new_order_ref_number;
+                    new_order.price = msg.price;
+                    new_order.qty = msg.shares;
+                    
+                    order_table_.erase(msg.original_order_ref_number);
+                    order_table_.insert(msg.new_order_ref_number, new_order);
+                    book->add_order(msg.new_order_ref_number, new_order.side, msg.price, msg.shares);
+                    replaces_++;
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'S': {
+                itch::SystemEvent msg;
+                msg.parse(payload);
+                if (should_print) itch::print_system_event(msg, seq);
+                break;
+            }
+            case 'P': {
+                itch::Trade msg;
+                msg.parse(payload);
+                if (should_print) itch::print_trade(msg, seq);
+                break;
+            }
+            default:
+                break;
+        }
+        
+        auto t1 = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        latency_tracker_.record(dt);
+        
+        ptr += msg_len;
+        seq++;
+        msg_count_++;
+    }
+}
+
+// Mode 3: Pipeline + book (two-threaded with SPSC)
+void Engine::run_pipeline_book() {
+    MappedFile mfile(config_.input_file);
+    
+    ITCHQueue queue;
+    std::atomic<bool> reader_done{false};
+    
+    // Reader thread: parse framing and timestamp
+    std::thread reader_thread([&]() {
+        const uint8_t* ptr = mfile.data();
+        const uint8_t* end = ptr + mfile.size();
+        uint64_t seq = 0;
+        
+        while (ptr + 2 <= end) {
+            uint16_t msg_len = be16_to_host(ptr);
+            ptr += 2;
+            
+            if (ptr + msg_len > end || msg_len < 1) break;
+            
+            char msg_type = static_cast<char>(*ptr);
+            
+            // Timestamp AFTER framing validation
+            auto t0 = std::chrono::steady_clock::now();
+            uint64_t t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t0.time_since_epoch()
+            ).count();
+            
+            MessageEnvelope envelope{msg_type, msg_len, 0, ptr, seq, t0_ns};
+            
+            while (!queue.try_push(envelope)) {
+                std::this_thread::yield();
+            }
+            
+            ptr += msg_len;
+            seq++;
+        }
+        
+        reader_done.store(true, std::memory_order_release);
+    });
+    
+    // Worker thread: apply to book and measure end-to-end latency
+    uint64_t processed = 0;
+    MessageEnvelope envelope;
+    
+    while (true) {
+        if (queue.try_pop(envelope)) {
+            const uint8_t* payload = envelope.data + 1;
+            bool should_print = envelope.seq < config_.print_first;
+            
+            switch (envelope.type) {
+                case 'A': {
+                    itch::AddOrder msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_add_order(msg, envelope.seq);
+                    
+                    SymbolKey sym_key = read_symbol_key(payload + 23); // stock offset (was 19, FIXED)
+                    bool matches = config_.symbols.empty() || config_.symbols.contains(sym_key);
+                    debug_print_symbol(msg.stock, sym_key, matches);
+                    
+                    if (matches) {
+                        Order order;
+                        order.order_id = msg.order_ref_number;
+                        order.symbol = sym_key;
+                        order.price = msg.price;
+                        order.qty = msg.shares;
+                        order.stock_locate = msg.stock_locate;
+                        order.side = msg.buy_sell;
+                        
+                        order_table_.insert(msg.order_ref_number, order);
+                        auto* book = book_registry_.get_or_create(msg.stock);
+                        book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                        adds_++;
+                    } else {
+                        skipped_symbols_++;
+                    }
+                    break;
+                }
+                case 'F': {
+                    itch::AddOrderMPID msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_add_order_mpid(msg, envelope.seq);
+                    
+                    SymbolKey sym_key = read_symbol_key(payload + 23); // stock offset (was 19, FIXED)
+                    bool matches = config_.symbols.empty() || config_.symbols.contains(sym_key);
+                    debug_print_symbol(msg.stock, sym_key, matches);
+                    
+                    if (matches) {
+                        Order order;
+                        order.order_id = msg.order_ref_number;
+                        order.symbol = sym_key;
+                        order.price = msg.price;
+                        order.qty = msg.shares;
+                        order.stock_locate = msg.stock_locate;
+                        order.side = msg.buy_sell;
+                        
+                        order_table_.insert(msg.order_ref_number, order);
+                        auto* book = book_registry_.get_or_create(msg.stock);
+                        book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                        adds_++;
+                    } else {
+                        skipped_symbols_++;
+                    }
+                    break;
+                }
+                case 'E': {
+                    itch::OrderExecuted msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_order_executed(msg, envelope.seq);
+                    
+                    Order* order = order_table_.find(msg.order_ref_number);
+                    if (order) {
+                        std::string stock_str = symbol_key_to_string(order->symbol);
+                        auto* book = book_registry_.get_or_create(stock_str);
+                        book->remove_order(order->side, order->price, msg.executed_shares);
+                        order->qty -= msg.executed_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        execs_++;
+                    } else {
+                        unknown_order_events_++;
+                    }
+                    break;
+                }
+                case 'C': {
+                    itch::OrderExecutedWithPrice msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_order_executed_with_price(msg, envelope.seq);
+                    
+                    Order* order = order_table_.find(msg.order_ref_number);
+                    if (order) {
+                        std::string stock_str = symbol_key_to_string(order->symbol);
+                        auto* book = book_registry_.get_or_create(stock_str);
+                        book->remove_order(order->side, order->price, msg.executed_shares);
+                        order->qty -= msg.executed_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        execs_++;
+                    } else {
+                        unknown_order_events_++;
+                    }
+                    break;
+                }
+                case 'X': {
+                    itch::OrderCancel msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_order_cancel(msg, envelope.seq);
+                    
+                    Order* order = order_table_.find(msg.order_ref_number);
+                    if (order) {
+                        std::string stock_str = symbol_key_to_string(order->symbol);
+                        auto* book = book_registry_.get_or_create(stock_str);
+                        book->remove_order(order->side, order->price, msg.cancelled_shares);
+                        order->qty -= msg.cancelled_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        cancels_++;
+                    } else {
+                        unknown_order_events_++;
+                    }
+                    break;
+                }
+                case 'D': {
+                    itch::OrderDelete msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_order_delete(msg, envelope.seq);
+                    
+                    Order* order = order_table_.find(msg.order_ref_number);
+                    if (order) {
+                        std::string stock_str = symbol_key_to_string(order->symbol);
+                        auto* book = book_registry_.get_or_create(stock_str);
+                        book->remove_order(order->side, order->price, order->qty);
+                        order_table_.erase(msg.order_ref_number);
+                        deletes_++;
+                    } else {
+                        unknown_order_events_++;
+                    }
+                    break;
+                }
+                case 'U': {
+                    itch::OrderReplace msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_order_replace(msg, envelope.seq);
+                    
+                    Order* old_order = order_table_.find(msg.original_order_ref_number);
+                    if (old_order) {
+                        std::string stock_str = symbol_key_to_string(old_order->symbol);
+                        auto* book = book_registry_.get_or_create(stock_str);
+                        book->remove_order(old_order->side, old_order->price, old_order->qty);
+                        
+                        Order new_order = *old_order;
+                        new_order.order_id = msg.new_order_ref_number;
+                        new_order.price = msg.price;
+                        new_order.qty = msg.shares;
+                        
+                        order_table_.erase(msg.original_order_ref_number);
+                        order_table_.insert(msg.new_order_ref_number, new_order);
+                        book->add_order(msg.new_order_ref_number, new_order.side, msg.price, msg.shares);
+                        replaces_++;
+                    } else {
+                        unknown_order_events_++;
+                    }
+                    break;
+                }
+                case 'S': {
+                    itch::SystemEvent msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_system_event(msg, envelope.seq);
+                    break;
+                }
+                case 'P': {
+                    itch::Trade msg;
+                    msg.parse(payload);
+                    if (should_print) itch::print_trade(msg, envelope.seq);
+                    break;
+                }
+                default:
+                    break;
+            }
+            
+            // Measure end-to-end latency (after book update)
+            auto t1 = std::chrono::steady_clock::now();
+            uint64_t t1_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t1.time_since_epoch()
+            ).count();
+            uint64_t latency_ns = t1_ns - envelope.t0_ns;
+            latency_tracker_.record(latency_ns);
+            
+            processed++;
+        } else {
+            if (reader_done.load(std::memory_order_acquire) && queue.empty()) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+    
+    reader_thread.join();
+    msg_count_ = processed;
+}
+
+// Mode 4: Full book (single-threaded, ALL symbols)
+void Engine::run_full_book() {
+    MappedFile mfile(config_.input_file);
+    
+    const uint8_t* ptr = mfile.data();
+    const uint8_t* end = ptr + mfile.size();
+    
+    uint64_t seq = 0;
+    
+    while (ptr + 2 <= end) {
+        uint16_t msg_len = be16_to_host(ptr);
+        ptr += 2;
+        
+        if (ptr + msg_len > end || msg_len < 1) break;
+        
+        char msg_type = static_cast<char>(*ptr);
+        
+        auto t0 = std::chrono::steady_clock::now();
+        
+        // Parse AND apply to book (NO symbol filtering)
+        const uint8_t* payload = ptr + 1;
+        bool should_print = seq < config_.print_first;
+        
+        switch (msg_type) {
+            case 'A': {
+                itch::AddOrder msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order(msg, seq);
+                
+                SymbolKey sym_key = read_symbol_key(payload + 23);
+                debug_print_symbol(msg.stock, sym_key, true);
+                
+                Order order;
+                order.order_id = msg.order_ref_number;
+                order.symbol = sym_key;
+                order.price = msg.price;
+                order.qty = msg.shares;
+                order.stock_locate = msg.stock_locate;
+                order.side = msg.buy_sell;
+                
+                order_table_.insert(msg.order_ref_number, order);
+                auto* book = symbol_book_registry_.get_or_create(sym_key);
+                if (book) {
+                    book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                    adds_++;
+                }
+                break;
+            }
+            case 'F': {
+                itch::AddOrderMPID msg;
+                msg.parse(payload);
+                if (should_print) itch::print_add_order_mpid(msg, seq);
+                
+                SymbolKey sym_key = read_symbol_key(payload + 23);
+                debug_print_symbol(msg.stock, sym_key, true);
+                
+                Order order;
+                order.order_id = msg.order_ref_number;
+                order.symbol = sym_key;
+                order.price = msg.price;
+                order.qty = msg.shares;
+                order.stock_locate = msg.stock_locate;
+                order.side = msg.buy_sell;
+                
+                order_table_.insert(msg.order_ref_number, order);
+                auto* book = symbol_book_registry_.get_or_create(sym_key);
+                if (book) {
+                    book->add_order(msg.order_ref_number, msg.buy_sell, msg.price, msg.shares);
+                    adds_++;
+                }
+                break;
+            }
+            case 'E': {
+                itch::OrderExecuted msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    auto* book = symbol_book_registry_.get_or_create(order->symbol);
+                    if (book) {
+                        book->remove_order(order->side, order->price, msg.executed_shares);
+                        order->qty -= msg.executed_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        execs_++;
+                    }
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'C': {
+                itch::OrderExecutedWithPrice msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_executed_with_price(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    auto* book = symbol_book_registry_.get_or_create(order->symbol);
+                    if (book) {
+                        book->remove_order(order->side, order->price, msg.executed_shares);
+                        order->qty -= msg.executed_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        execs_++;
+                    }
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'X': {
+                itch::OrderCancel msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_cancel(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    auto* book = symbol_book_registry_.get_or_create(order->symbol);
+                    if (book) {
+                        book->remove_order(order->side, order->price, msg.cancelled_shares);
+                        order->qty -= msg.cancelled_shares;
+                        if (order->qty == 0) {
+                            order_table_.erase(msg.order_ref_number);
+                        }
+                        cancels_++;
+                    }
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'D': {
+                itch::OrderDelete msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_delete(msg, seq);
+                
+                Order* order = order_table_.find(msg.order_ref_number);
+                if (order) {
+                    auto* book = symbol_book_registry_.get_or_create(order->symbol);
+                    if (book) {
+                        book->remove_order(order->side, order->price, order->qty);
+                        order_table_.erase(msg.order_ref_number);
+                        deletes_++;
+                    }
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'U': {
+                itch::OrderReplace msg;
+                msg.parse(payload);
+                if (should_print) itch::print_order_replace(msg, seq);
+                
+                Order* old_order = order_table_.find(msg.original_order_ref_number);
+                if (old_order) {
+                    auto* book = symbol_book_registry_.get_or_create(old_order->symbol);
+                    if (book) {
+                        book->remove_order(old_order->side, old_order->price, old_order->qty);
+                        
+                        Order new_order = *old_order;
+                        new_order.order_id = msg.new_order_ref_number;
+                        new_order.price = msg.price;
+                        new_order.qty = msg.shares;
+                        
+                        order_table_.erase(msg.original_order_ref_number);
+                        order_table_.insert(msg.new_order_ref_number, new_order);
+                        book->add_order(msg.new_order_ref_number, new_order.side, msg.price, msg.shares);
+                        replaces_++;
+                    }
+                } else {
+                    unknown_order_events_++;
+                }
+                break;
+            }
+            case 'S': {
+                itch::SystemEvent msg;
+                msg.parse(payload);
+                if (should_print) itch::print_system_event(msg, seq);
+                break;
+            }
+            case 'P': {
+                itch::Trade msg;
+                msg.parse(payload);
+                if (should_print) itch::print_trade(msg, seq);
+                break;
+            }
+            default:
+                break;
+        }
+        
+        auto t1 = std::chrono::steady_clock::now();
+        auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        latency_tracker_.record(dt);
+        
+        ptr += msg_len;
+        seq++;
+        msg_count_++;
+    }
+}
+
+// Legacy method (kept for backward compatibility)
+void Engine::parse_and_process() {
+    // Delegate to parse mode
+    run_parse();
 }
 
 void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uint64_t seq) {
@@ -114,13 +883,14 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 // Apply to symbol filter if specified
                 if (config_.symbol_filter.empty() || msg.stock == config_.symbol_filter) {
+                    SymbolKey sym_key = read_symbol_key(payload + 23);
                     Order order;
                     order.order_id = msg.order_ref_number;
+                    order.symbol = sym_key;
                     order.price = msg.price;
                     order.qty = msg.shares;
                     order.stock_locate = msg.stock_locate;
                     order.side = msg.buy_sell;
-                    order.stock = msg.stock;
                     
                     order_table_.insert(msg.order_ref_number, order);
                     
@@ -140,13 +910,14 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             
             if (config_.enable_book) {
                 if (config_.symbol_filter.empty() || msg.stock == config_.symbol_filter) {
+                    SymbolKey sym_key = read_symbol_key(payload + 23);
                     Order order;
                     order.order_id = msg.order_ref_number;
+                    order.symbol = sym_key;
                     order.price = msg.price;
                     order.qty = msg.shares;
                     order.stock_locate = msg.stock_locate;
                     order.side = msg.buy_sell;
-                    order.stock = msg.stock;
                     
                     order_table_.insert(msg.order_ref_number, order);
                     
@@ -167,8 +938,9 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 Order* order = order_table_.find(msg.order_ref_number);
                 if (order) {
-                    if (config_.symbol_filter.empty() || order->stock == config_.symbol_filter) {
-                        auto* book = book_registry_.get_or_create(order->stock);
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    if (config_.symbol_filter.empty() || stock_str == config_.symbol_filter) {
+                        auto* book = book_registry_.get_or_create(stock_str);
                         book->remove_order(order->side, order->price, msg.executed_shares);
                         
                         // Update order quantity
@@ -192,8 +964,9 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 Order* order = order_table_.find(msg.order_ref_number);
                 if (order) {
-                    if (config_.symbol_filter.empty() || order->stock == config_.symbol_filter) {
-                        auto* book = book_registry_.get_or_create(order->stock);
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    if (config_.symbol_filter.empty() || stock_str == config_.symbol_filter) {
+                        auto* book = book_registry_.get_or_create(stock_str);
                         book->remove_order(order->side, order->price, msg.executed_shares);
                         
                         order->qty -= msg.executed_shares;
@@ -216,8 +989,9 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 Order* order = order_table_.find(msg.order_ref_number);
                 if (order) {
-                    if (config_.symbol_filter.empty() || order->stock == config_.symbol_filter) {
-                        auto* book = book_registry_.get_or_create(order->stock);
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    if (config_.symbol_filter.empty() || stock_str == config_.symbol_filter) {
+                        auto* book = book_registry_.get_or_create(stock_str);
                         book->remove_order(order->side, order->price, msg.cancelled_shares);
                         
                         order->qty -= msg.cancelled_shares;
@@ -240,8 +1014,9 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 Order* order = order_table_.find(msg.order_ref_number);
                 if (order) {
-                    if (config_.symbol_filter.empty() || order->stock == config_.symbol_filter) {
-                        auto* book = book_registry_.get_or_create(order->stock);
+                    std::string stock_str = symbol_key_to_string(order->symbol);
+                    if (config_.symbol_filter.empty() || stock_str == config_.symbol_filter) {
+                        auto* book = book_registry_.get_or_create(stock_str);
                         book->remove_order(order->side, order->price, order->qty);
                         order_table_.erase(msg.order_ref_number);
                     }
@@ -260,8 +1035,9 @@ void Engine::process_message(char type, const uint8_t* data, size_t /*len*/, uin
             if (config_.enable_book) {
                 Order* old_order = order_table_.find(msg.original_order_ref_number);
                 if (old_order) {
-                    if (config_.symbol_filter.empty() || old_order->stock == config_.symbol_filter) {
-                        auto* book = book_registry_.get_or_create(old_order->stock);
+                    std::string stock_str = symbol_key_to_string(old_order->symbol);
+                    if (config_.symbol_filter.empty() || stock_str == config_.symbol_filter) {
+                        auto* book = book_registry_.get_or_create(stock_str);
                         
                         // Remove old order
                         book->remove_order(old_order->side, old_order->price, old_order->qty);
@@ -334,7 +1110,7 @@ void Engine::parse_and_process_spsc() {
             
             char msg_type = static_cast<char>(*ptr);
             
-            MessageEnvelope envelope{msg_type, msg_len, 0, ptr, seq};
+            MessageEnvelope envelope{msg_type, msg_len, 0, ptr, seq, 0};
             
             // Spin until we can push (queue full backpressure)
             while (!queue.try_push(envelope)) {
