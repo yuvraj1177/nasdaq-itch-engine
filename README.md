@@ -364,6 +364,20 @@ The engine expects a **decompressed** ITCH 5.0 file with **2-byte length framing
 - Stock symbols are 8-byte right-padded with spaces
 - The engine uses `MADV_SEQUENTIAL` for optimal mmap performance
 
+## Disclaimer
+
+This project is provided for **educational and research purposes only**.
+
+- It is **not affiliated with, endorsed by, or connected to NASDAQ**
+- It is **not a production trading system**
+- It must **not be used for live trading, regulatory, or compliance purposes**
+- All processing is performed on **publicly available historical market data**
+
 ## License
 
-This is a demonstration project for low-latency trading system development.
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT License
+
+at your option.
