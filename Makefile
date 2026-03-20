@@ -1,42 +1,60 @@
-# Makefile for ITCH 5.0 Market Data Engine
+# ── ITCH 5.0 Low-Latency Market Data Engine ──────────────────────────────────
 
-CXX = c++
-CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic -O3 -march=native -DNDEBUG
-CXXFLAGS_DEBUG = -std=c++20 -Wall -Wextra -pedantic -g -O0
+CXX        = c++
+CXXFLAGS   = -std=c++20 -Wall -Wextra -pedantic -O3 -march=native -DNDEBUG
+DBG_FLAGS  = -std=c++20 -Wall -Wextra -pedantic -g -O0
+INCLUDES   = -Iinclude
 
-TARGET = itch_engine
-REPLAY_TARGET = replay_csv
+# Directories
+BUILD_DIR  = build/bin
+SRC_DIR    = src
+TOOLS_DIR  = tools
 
-SRCS = src/main.cpp src/engine.cpp src/itch_parser.cpp src/order_book.cpp src/l3_csv_exporter.cpp
-OBJS = $(SRCS:.cpp=.o)
+# Targets
+TARGET        = $(BUILD_DIR)/itch_engine
+REPLAY_TARGET = $(BUILD_DIR)/replay_csv
 
-REPLAY_SRCS = tools/replay_csv.cpp
+# Sources
+SRCS       = $(SRC_DIR)/main.cpp \
+             $(SRC_DIR)/engine.cpp \
+             $(SRC_DIR)/itch_parser.cpp \
+             $(SRC_DIR)/order_book.cpp \
+             $(SRC_DIR)/l3_csv_exporter.cpp
+
+REPLAY_SRCS = $(TOOLS_DIR)/replay_csv.cpp
+
+OBJS        = $(SRCS:.cpp=.o)
 REPLAY_OBJS = $(REPLAY_SRCS:.cpp=.o)
 
-.PHONY: all clean debug
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+.PHONY: all clean debug run-test
 
 all: $(TARGET) $(REPLAY_TARGET)
 
-$(TARGET): $(OBJS)
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)
+
+$(TARGET): $(OBJS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-$(REPLAY_TARGET): $(REPLAY_OBJS)
+$(REPLAY_TARGET): $(REPLAY_OBJS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) -Isrc -c $< -o $@
+$(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-tools/%.o: tools/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(TOOLS_DIR)/%.o: $(TOOLS_DIR)/%.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-debug: CXXFLAGS = $(CXXFLAGS_DEBUG)
-debug: clean $(TARGET)
+debug: CXXFLAGS = $(DBG_FLAGS)
+debug: clean all
 
 clean:
-	rm -f $(TARGET) $(REPLAY_TARGET) $(OBJS) $(REPLAY_OBJS)
+	rm -rf $(BUILD_DIR) $(OBJS) $(REPLAY_OBJS)
 
 run-test: $(TARGET)
-	@echo "To test, first decompress the ITCH file:"
-	@echo "  gunzip -k 01302020.NASDAQ_ITCH50.gz"
+	@echo "To test, first place the ITCH file in data/:"
+	@echo "  gunzip -k data/01302020.NASDAQ_ITCH50.gz"
 	@echo "Then run:"
-	@echo "  ./$(TARGET) --file 01302020.NASDAQ_ITCH50 --print-first 100"
+	@echo "  $(TARGET) --file data/01302020.NASDAQ_ITCH50 --mode parse --print-first 100"

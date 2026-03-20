@@ -14,16 +14,37 @@ A production-style, high-performance C++20 market data engine for processing NAS
 - **Symbol filtering**: Track specific symbols for cache-friendly benchmarking
 - **High throughput**: 4.5M msgs/sec full_book, 10.1M msgs/sec parse-only
 
-## Architecture
+## Project Structure
 
 ```
-src/
-├── main.cpp              - CLI argument parsing and entry point
-├── engine.{h,cpp}        - Main processing engine and message dispatcher
-├── itch_parser.{h,cpp}   - ITCH 5.0 message parsing and decoding
-├── order_book.{h,cpp}    - Order book and order table implementation
-├── latency_tracker.h     - Performance measurement and statistics
-└── mapped_file.h         - RAII wrapper for mmap
+.
+├── include/itch/              Public headers
+│   ├── engine.h               Main processing engine
+│   ├── engine_threaded.h      Dual-threaded SPSC pipeline
+│   ├── itch_parser.h          ITCH 5.0 message decoding
+│   ├── l3_csv_exporter.h      High-performance CSV writer
+│   ├── latency_tracker.h      Percentile latency measurement
+│   ├── mapped_file.h          RAII mmap wrapper
+│   ├── order_book.h           Baseline order book (std::map)
+│   ├── order_book_optimized.h Robin Hood hash + flat-array book
+│   ├── spsc_queue.h           Lock-free SPSC queue (variant 1)
+│   └── spsc_ring.h            Lock-free SPSC ring  (variant 2)
+├── src/                       Implementation
+│   ├── main.cpp               CLI entry point
+│   ├── engine.cpp             Engine message dispatch loop
+│   ├── itch_parser.cpp        Human-readable message printing
+│   ├── l3_csv_exporter.cpp    Buffered CSV row writer
+│   └── order_book.cpp         Order book stub
+├── tools/
+│   └── replay_csv.cpp         CSV replay & book validator
+├── data/                      ITCH binary files (gitignored)
+├── output/                    Generated CSVs, latency dumps (gitignored)
+├── docs/
+│   ├── IMPLEMENTATION.md      Detailed design notes
+│   └── PERFORMANCE.md         Benchmarking methodology
+├── CMakeLists.txt
+├── Makefile
+└── README.md
 ```
 
 ## Building
@@ -39,7 +60,9 @@ make              # Build optimized release binary + replay tool
 make clean        # Clean build artifacts
 ```
 
-The compiled binaries will be `itch_engine` and `replay_csv`.
+Compiled binaries are written to `build/bin/`:
+- `build/bin/itch_engine` -- main engine
+- `build/bin/replay_csv` -- CSV replay validator
 
 ## Benchmark Modes
 
@@ -49,28 +72,28 @@ The engine supports four benchmark modes to measure different performance charac
 **Purpose**: Measure pure parsing throughput (no book updates)
 
 ```bash
-./itch_engine --mode parse --file 01302020.NASDAQ_ITCH50
+./build/bin/itch_engine --mode parse --file data/01302020.NASDAQ_ITCH50
 ```
 
 ### Mode 2: Parse + Book (Single-Threaded, Filtered)
 **Purpose**: Measure end-to-end latency including order book updates for selected symbols
 
 ```bash
-./itch_engine --mode parse_book --file 01302020.NASDAQ_ITCH50 --symbols AAPL,MSFT,AMZN
+./build/bin/itch_engine --mode parse_book --file data/01302020.NASDAQ_ITCH50 --symbols AAPL,MSFT,AMZN
 ```
 
 ### Mode 3: Pipeline + Book (Dual-Threaded, Filtered)
 **Purpose**: Measure pipeline latency with reader/worker thread separation for selected symbols
 
 ```bash
-./itch_engine --mode pipeline_book --file 01302020.NASDAQ_ITCH50 --symbol AAPL
+./build/bin/itch_engine --mode pipeline_book --file data/01302020.NASDAQ_ITCH50 --symbol AAPL
 ```
 
 ### Mode 4: Full Book (Single-Threaded, ALL Symbols)
 **Purpose**: Realistic stress test maintaining order books for ALL symbols (no filtering)
 
 ```bash
-./itch_engine --mode full_book --file 01302020.NASDAQ_ITCH50
+./build/bin/itch_engine --mode full_book --file data/01302020.NASDAQ_ITCH50
 ```
 
 **Expected behavior:**
@@ -160,21 +183,22 @@ price_ticks = price_1e4 / 100
 
 #### Generate CSV for full trading day
 ```bash
-# Prerequisite: decompress ITCH file
-gunzip -k 01302020.NASDAQ_ITCH50.gz
+# Prerequisite: decompress ITCH file into data/
+gunzip -k data/01302020.NASDAQ_ITCH50.gz
 
 # Generate CSV (logs go to stderr, CSV to stdout)
-./itch_engine --file 01302020.NASDAQ_ITCH50 --mode full_book --csv --csv-header > simulation_input.csv 2> logs.txt
+./build/bin/itch_engine --file data/01302020.NASDAQ_ITCH50 \
+  --mode full_book --csv --csv-header > output/full_book.csv 2> output/generation.log
 
 # Check results
-wc -l simulation_input.csv
-# Expected: ~417M rows (99% book hit rate)
+wc -l output/full_book.csv
+# Expected: ~454M rows (99% book hit rate)
 ```
 
 #### Validate CSV (Replay & Verify)
 ```bash
 # Replay CSV and rebuild order book
-./replay_csv simulation_input.csv
+./build/bin/replay_csv output/full_book.csv
 
 # Output shows:
 # - Total events processed
@@ -210,13 +234,13 @@ timestamp_ns,event_type,order_id,price_ticks,size,side
 ### Step 0: Decompress ITCH file
 
 ```bash
-gunzip -k 01302020.NASDAQ_ITCH50.gz
+gunzip -k data/01302020.NASDAQ_ITCH50.gz
 ```
 
 ### Step 1: Validate parsing (print first 100 messages)
 
 ```bash
-./itch_engine --mode parse --file 01302020.NASDAQ_ITCH50 --print-first 100
+./build/bin/itch_engine --mode parse --file data/01302020.NASDAQ_ITCH50 --print-first 100
 ```
 
 Sample output:
@@ -230,22 +254,22 @@ Sample output:
 ### Step 2: Benchmark with multiple symbols
 
 ```bash
-./itch_engine --mode parse_book --file 01302020.NASDAQ_ITCH50 \
-  --symbols AAPL,MSFT,AMZN,GOOGL,TSLA --latency-out latencies.csv
+./build/bin/itch_engine --mode parse_book --file data/01302020.NASDAQ_ITCH50 \
+  --symbols AAPL,MSFT,AMZN,GOOGL,TSLA --latency-out output/latencies.csv
 ```
 
 ### Step 3: Test pipeline mode with single symbol
 
 ```bash
-./itch_engine --mode pipeline_book --file 01302020.NASDAQ_ITCH50 \
-  --symbol AAPL --latency-out pipeline_lat.csv
+./build/bin/itch_engine --mode pipeline_book --file data/01302020.NASDAQ_ITCH50 \
+  --symbol AAPL --latency-out output/pipeline_lat.csv
 ```
 
 ### Step 4: Run full book stress test
 
 ```bash
-./itch_engine --mode full_book --file 01302020.NASDAQ_ITCH50 \
-  --latency-out full_book_lat.csv
+./build/bin/itch_engine --mode full_book --file data/01302020.NASDAQ_ITCH50 \
+  --latency-out output/full_book_lat.csv
 ```
 
 ### Debug Symbol Parsing
@@ -253,7 +277,7 @@ Sample output:
 To verify symbol extraction is correct, use `--debug-symbols` to print the first 20 encountered symbols:
 
 ```bash
-./itch_engine --mode parse_book --file 01302020.NASDAQ_ITCH50 \
+./build/bin/itch_engine --mode parse_book --file data/01302020.NASDAQ_ITCH50 \
   --symbol AAPL --debug-symbols
 ```
 

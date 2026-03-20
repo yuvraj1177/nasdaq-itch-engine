@@ -1,8 +1,4 @@
-# Binaries
-itch_engine
-replay_csv
-
-# Build artifacts
+# ── Build artifacts ───────────────────────────────────────────────────────────
 build/
 *.o
 *.a
@@ -10,36 +6,25 @@ build/
 *.dylib
 *.out
 
-# Data files (ITCH binary files)
-*.NASDAQ_ITCH50
-*.itch
-*.bin
-*.gz
+# ── Data files (ITCH binary feeds) ───────────────────────────────────────────
+data/*
+!data/.gitkeep
 
-# Output files (latency dumps, CSV exports, logs)
-*.csv
-latencies*.txt
-*.log
-simulation_input.csv
+# ── Output files (latency dumps, CSV exports, logs) ─────────────────────────
+output/*
+!output/.gitkeep
 
-# Implementation guide (not for GitHub)
-IMPLEMENTATION.md
-
-# Build directories
-build/
+# ── Build system generated ───────────────────────────────────────────────────
 cmake-build-*/
+compile_commands.json
 
-# IDE files
+# ── IDE / editor ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS files
+# ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# Plot outputs
-*.png
-*.pdf

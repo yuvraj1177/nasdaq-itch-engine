@@ -1,6 +1,6 @@
-#include "engine.h"
-#include "itch_parser.h"
-#include "spsc_queue.h"
+#include "itch/engine.h"
+#include "itch/itch_parser.h"
+#include "itch/spsc_queue.h"
 #include <iostream>
 #include <chrono>
 #include <thread>
